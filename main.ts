@@ -90,7 +90,7 @@ interface AutocorrectSettings {
   ignoreList: string[];
 }
 
-const DEFAULT_SETTINGS: AutocorrectSettings = {
+export const DEFAULT_SETTINGS: AutocorrectSettings = {
   enabled: true,
   customCorrections: {},
   promotedCorrections: {},
