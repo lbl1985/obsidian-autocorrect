@@ -1,8 +1,9 @@
 import { Plugin, PluginSettingTab, App, Setting, Notice } from "obsidian";
-import { EditorView, ViewUpdate, Decoration, DecorationSet } from "@codemirror/view";
+import { EditorView, ViewUpdate, Decoration, DecorationSet, Tooltip, showTooltip, tooltips } from "@codemirror/view";
 import { StateField, StateEffect, Transaction, Annotation, Extension, RangeSetBuilder } from "@codemirror/state";
 import { syntaxTree } from "@codemirror/language";
 import { BUILTIN_DICTIONARY, AMBIGUOUS_WORDS } from "./dictionary";
+import { initSpellChecker, checkWord, SpellCheckerInstance } from "./spellcheck";
 
 
 // ============================================================================
@@ -85,6 +86,7 @@ function isInExclusionZone(state: any, from: number, to: number): boolean {
 
 interface AutocorrectSettings {
   enabled: boolean;
+  enableSpellCheck: boolean;
   customCorrections: Record<string, string>;
   promotedCorrections: Record<string, string>;
   ignoreList: string[];
@@ -92,10 +94,73 @@ interface AutocorrectSettings {
 
 export const DEFAULT_SETTINGS: AutocorrectSettings = {
   enabled: true,
+  enableSpellCheck: false,
   customCorrections: {},
   promotedCorrections: {},
   ignoreList: [],
 };
+
+// ============================================================================
+// Spell-check suggestion tooltip
+// ============================================================================
+
+const setSpellTooltip = StateEffect.define<Tooltip | null>();
+
+const spellTooltipField = StateField.define<Tooltip | null>({
+  create: () => null,
+  update(tooltip, tr) {
+    if (tr.docChanged) return null; // dismiss whenever the document changes
+    for (const e of tr.effects) {
+      if (e.is(setSpellTooltip)) return e.value;
+    }
+    return tooltip;
+  },
+  provide: (f) => showTooltip.from(f),
+});
+
+function createSpellTooltip(
+  wordStart: number,
+  wordEnd: number,
+  originalWord: string,
+  suggestions: string[]
+): Tooltip {
+  return {
+    pos: wordStart,
+    above: true,
+    strictSide: false,
+    arrow: false,
+    create(view: EditorView) {
+      const dom = document.createElement("div");
+      dom.className = "autocorrect-spell-tooltip";
+
+      for (const suggestion of suggestions) {
+        const btn = document.createElement("button");
+        btn.textContent = suggestion;
+        btn.className = "autocorrect-spell-btn";
+        btn.addEventListener("mousedown", (e) => {
+          e.preventDefault(); // keep editor focus
+          view.dispatch({
+            changes: { from: wordStart, to: wordEnd, insert: preserveCase(originalWord, suggestion) },
+            annotations: [autocorrectAnnotation.of(true), Transaction.addToHistory.of(true)],
+          });
+        });
+        dom.appendChild(btn);
+      }
+
+      const dismiss = document.createElement("button");
+      dismiss.textContent = "×";
+      dismiss.className = "autocorrect-spell-dismiss";
+      dismiss.title = "Dismiss";
+      dismiss.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        view.dispatch({ effects: setSpellTooltip.of(null) });
+      });
+      dom.appendChild(dismiss);
+
+      return { dom };
+    },
+  };
+}
 
 // ============================================================================
 // Autocorrect CM6 Extension
@@ -105,7 +170,8 @@ const autocorrectAnnotation = Annotation.define<boolean>();
 
 function createAutocorrectExtension(
   getSettings: () => AutocorrectSettings,
-  getDictionary: () => Map<string, string>
+  getDictionary: () => Map<string, string>,
+  getSpellChecker: () => SpellCheckerInstance | null
 ): Extension {
   return EditorView.updateListener.of((update: ViewUpdate) => {
     if (!getSettings().enabled) return;
@@ -119,6 +185,8 @@ function createAutocorrectExtension(
     }
 
     const changes: Array<{ from: number; to: number; insert: string }> = [];
+    type SpellCandidate = { wordStart: number; wordEnd: number; originalWord: string; suggestions: string[] };
+    const spellCandidates: SpellCandidate[] = [];
 
     update.changes.iterChanges((fromA: number, toA: number, fromB: number, toB: number, inserted: any) => {
       const insertedText = inserted.toString();
@@ -157,26 +225,46 @@ function createAutocorrectExtension(
       const settings = getSettings();
       if (settings.ignoreList.some(w => w.toLowerCase() === word.toLowerCase())) return;
 
-      // Look up correction
+      // 1. Look up in the curated dictionary first
       const dictionary = getDictionary();
       const correction = dictionary.get(word.toLowerCase());
-      if (!correction) return;
+      if (correction) {
+        const corrected = preserveCase(word, correction);
+        if (corrected !== word) changes.push({ from: wordStart, to: wordEnd, insert: corrected });
+        return;
+      }
 
-      // Apply case preservation
-      const corrected = preserveCase(word, correction);
-      if (corrected === word) return;
+      // 2. Fall back to spell checker (when enabled)
+      if (!settings.enableSpellCheck) return;
+      const spell = getSpellChecker();
+      if (!spell) return;
 
-      changes.push({ from: wordStart, to: wordEnd, insert: corrected });
+      const result = checkWord(spell, word);
+      if (result.kind === "auto") {
+        const corrected = preserveCase(word, result.correction);
+        if (corrected !== word) changes.push({ from: wordStart, to: wordEnd, insert: corrected });
+      } else if (result.kind === "ambiguous") {
+        spellCandidates.push({ wordStart, wordEnd, originalWord: word, suggestions: result.suggestions });
+      }
     });
 
     if (changes.length > 0) {
-      // Apply all corrections in one transaction
+      // Apply all corrections in one transaction; skip tooltip if there were auto-corrections
       update.view.dispatch({
         changes: changes,
         annotations: [
           autocorrectAnnotation.of(true),
           Transaction.addToHistory.of(true),
         ],
+      });
+      return;
+    }
+
+    // Show suggestion tooltip for the first ambiguous spell-check word
+    if (spellCandidates.length > 0) {
+      const { wordStart, wordEnd, originalWord, suggestions } = spellCandidates[0];
+      update.view.dispatch({
+        effects: setSpellTooltip.of(createSpellTooltip(wordStart, wordEnd, originalWord, suggestions)),
       });
     }
   });
@@ -208,6 +296,24 @@ class AutocorrectSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.enabled)
           .onChange(async (value) => {
             this.plugin.settings.enabled = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Enable spell check suggestions")
+      .setDesc(
+        "When a word is not in the built-in dictionary, use a spell checker to suggest corrections. " +
+        "High-confidence matches are corrected automatically; ambiguous ones show an inline popup."
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.enableSpellCheck)
+          .onChange(async (value) => {
+            this.plugin.settings.enableSpellCheck = value;
+            if (value && !this.plugin.spellChecker) {
+              this.plugin.spellChecker = initSpellChecker();
+            }
             await this.plugin.saveSettings();
           })
       );
@@ -423,18 +529,26 @@ export function buildDictionary(
 export default class AutocorrectPlugin extends Plugin {
   settings: AutocorrectSettings = DEFAULT_SETTINGS;
   dictionary: Map<string, string> = new Map();
+  spellChecker: SpellCheckerInstance | null = null;
 
   async onload() {
     await this.loadSettings();
     this.rebuildDictionary();
 
-    // Register the CM6 editor extension
-    this.registerEditorExtension(
+    if (this.settings.enableSpellCheck) {
+      this.spellChecker = initSpellChecker();
+    }
+
+    // Register the CM6 editor extensions
+    this.registerEditorExtension([
+      spellTooltipField,
+      tooltips(),
       createAutocorrectExtension(
         () => this.settings,
-        () => this.dictionary
-      )
-    );
+        () => this.dictionary,
+        () => this.spellChecker
+      ),
+    ]);
 
     // Register settings tab
     this.addSettingTab(new AutocorrectSettingTab(this.app, this));
