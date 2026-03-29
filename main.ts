@@ -86,12 +86,14 @@ function isInExclusionZone(state: any, from: number, to: number): boolean {
 interface AutocorrectSettings {
   enabled: boolean;
   customCorrections: Record<string, string>;
+  promotedCorrections: Record<string, string>;
   ignoreList: string[];
 }
 
 const DEFAULT_SETTINGS: AutocorrectSettings = {
   enabled: true,
   customCorrections: {},
+  promotedCorrections: {},
   ignoreList: [],
 };
 
@@ -220,6 +222,24 @@ class AutocorrectSettingTab extends PluginSettingTab {
     const customContainer = containerEl.createDiv("autocorrect-custom-list");
     this.renderCustomCorrections(customContainer);
 
+    // Merge all into built-in button
+    if (Object.keys(this.plugin.settings.customCorrections).length > 0) {
+      new Setting(containerEl)
+        .setName("Merge all into built-in")
+        .setDesc("Move all custom corrections into the built-in list. They stay active but no longer appear in the custom section.")
+        .addButton((button) =>
+          button.setButtonText("Merge all").onClick(async () => {
+            const custom = this.plugin.settings.customCorrections;
+            for (const [k, v] of Object.entries(custom)) {
+              this.plugin.settings.promotedCorrections[k] = v;
+            }
+            this.plugin.settings.customCorrections = {};
+            await this.plugin.saveSettings();
+            this.display();
+          })
+        );
+    }
+
     // Add new custom correction
     const addCorrectionDiv = containerEl.createDiv("autocorrect-add-correction");
     let newMisspelling = "";
@@ -278,10 +298,28 @@ class AutocorrectSettingTab extends PluginSettingTab {
 
     // Stats
     containerEl.createEl("h3", { text: "Dictionary Info" });
+    const promotedCount = Object.keys(this.plugin.settings.promotedCorrections).length;
     containerEl.createEl("p", {
-      text: `Built-in dictionary: ${Object.keys(BUILTIN_DICTIONARY).length} entries | Custom corrections: ${Object.keys(this.plugin.settings.customCorrections).length} entries | Ignore list: ${this.plugin.settings.ignoreList.length} words`,
+      text: `Built-in dictionary: ${Object.keys(BUILTIN_DICTIONARY).length} entries${promotedCount > 0 ? ` (+${promotedCount} promoted)` : ""} | Custom corrections: ${Object.keys(this.plugin.settings.customCorrections).length} entries | Ignore list: ${this.plugin.settings.ignoreList.length} words`,
       cls: "setting-item-description",
     });
+
+    if (promotedCount > 0) {
+      new Setting(containerEl)
+        .setName("Promoted corrections")
+        .setDesc(`${promotedCount} correction${promotedCount === 1 ? "" : "s"} merged into the built-in list. Reset to move them back to custom corrections.`)
+        .addButton((button) =>
+          button.setButtonText("Reset all").onClick(async () => {
+            const promoted = this.plugin.settings.promotedCorrections;
+            for (const [k, v] of Object.entries(promoted)) {
+              this.plugin.settings.customCorrections[k] = v;
+            }
+            this.plugin.settings.promotedCorrections = {};
+            await this.plugin.saveSettings();
+            this.display();
+          })
+        );
+    }
   }
 
   renderCustomCorrections(container: HTMLElement): void {
@@ -295,6 +333,15 @@ class AutocorrectSettingTab extends PluginSettingTab {
       item.style.marginBottom = "4px";
 
       item.createSpan({ text: `${misspelling} → ${correction}` });
+
+      const promoteBtn = item.createEl("button", { text: "↑", title: "Merge into built-in" });
+      promoteBtn.style.cursor = "pointer";
+      promoteBtn.addEventListener("click", async () => {
+        this.plugin.settings.promotedCorrections[misspelling] = correction;
+        delete this.plugin.settings.customCorrections[misspelling];
+        await this.plugin.saveSettings();
+        this.display();
+      });
 
       const deleteBtn = item.createEl("button", { text: "×" });
       deleteBtn.style.cursor = "pointer";
@@ -341,6 +388,38 @@ class AutocorrectSettingTab extends PluginSettingTab {
 // Plugin
 // ============================================================================
 
+export function buildDictionary(
+  customCorrections: Record<string, string>,
+  promotedCorrections: Record<string, string>,
+  ignoreList: string[]
+): Map<string, string> {
+  const dictionary = new Map<string, string>();
+
+  // Add built-in dictionary, excluding ambiguous words
+  for (const [key, value] of Object.entries(BUILTIN_DICTIONARY)) {
+    if (!AMBIGUOUS_WORDS.has(key)) {
+      dictionary.set(key, value);
+    }
+  }
+
+  // Add custom corrections (override built-in if conflicting)
+  for (const [key, value] of Object.entries(customCorrections)) {
+    dictionary.set(key.toLowerCase(), value);
+  }
+
+  // Add promoted corrections (treated as built-in, override if conflicting)
+  for (const [key, value] of Object.entries(promotedCorrections)) {
+    dictionary.set(key.toLowerCase(), value);
+  }
+
+  // Remove ignored words
+  for (const word of ignoreList) {
+    dictionary.delete(word.toLowerCase());
+  }
+
+  return dictionary;
+}
+
 export default class AutocorrectPlugin extends Plugin {
   settings: AutocorrectSettings = DEFAULT_SETTINGS;
   dictionary: Map<string, string> = new Map();
@@ -373,24 +452,11 @@ export default class AutocorrectPlugin extends Plugin {
   }
 
   rebuildDictionary() {
-    this.dictionary = new Map<string, string>();
-
-    // Add built-in dictionary, excluding ambiguous words
-    for (const [key, value] of Object.entries(BUILTIN_DICTIONARY)) {
-      if (!AMBIGUOUS_WORDS.has(key)) {
-        this.dictionary.set(key, value);
-      }
-    }
-
-    // Add custom corrections (override built-in if conflicting)
-    for (const [key, value] of Object.entries(this.settings.customCorrections)) {
-      this.dictionary.set(key.toLowerCase(), value);
-    }
-
-    // Remove ignored words
-    for (const word of this.settings.ignoreList) {
-      this.dictionary.delete(word.toLowerCase());
-    }
+    this.dictionary = buildDictionary(
+      this.settings.customCorrections,
+      this.settings.promotedCorrections,
+      this.settings.ignoreList
+    );
   }
 
   async loadSettings() {
