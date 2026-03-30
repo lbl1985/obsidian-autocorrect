@@ -1,6 +1,6 @@
 {
   "name": "obsidian-autocorrect",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Autocorrect plugin for Obsidian - automatically corrects common spelling mistakes as you type",
   "main": "main.js",
   "scripts": {

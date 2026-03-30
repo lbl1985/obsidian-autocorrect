@@ -1,7 +1,7 @@
 {
   "id": "obsidian-autocorrect",
   "name": "Autocorrect",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.0.0",
   "description": "Automatically corrects common spelling mistakes as you type. Includes 450+ built-in corrections, custom dictionary support, and smart context detection to skip code blocks, frontmatter, and wiki-links.",
   "author": "Binlong",
