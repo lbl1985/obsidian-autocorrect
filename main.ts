@@ -1,6 +1,6 @@
 import { Plugin, PluginSettingTab, App, Setting, Notice } from "obsidian";
-import { EditorView, ViewUpdate, Decoration, DecorationSet, Tooltip, showTooltip, tooltips } from "@codemirror/view";
-import { StateField, StateEffect, Transaction, Annotation, Extension, RangeSetBuilder } from "@codemirror/state";
+import { EditorView, ViewUpdate, Decoration, DecorationSet, Tooltip, showTooltip, tooltips, keymap } from "@codemirror/view";
+import { StateField, StateEffect, Transaction, Annotation, Extension, RangeSetBuilder, Prec } from "@codemirror/state";
 import { syntaxTree } from "@codemirror/language";
 import { BUILTIN_DICTIONARY, AMBIGUOUS_WORDS } from "./dictionary";
 import { initSpellChecker, checkWord, SpellCheckerInstance } from "./spellcheck";
@@ -101,31 +101,63 @@ export const DEFAULT_SETTINGS: AutocorrectSettings = {
 };
 
 // ============================================================================
-// Spell-check suggestion tooltip
+// Spell-check suggestion tooltip with keyboard navigation
 // ============================================================================
 
-const setSpellTooltip = StateEffect.define<Tooltip | null>();
+/** Pure navigation state — no CM6 types, easy to unit-test. */
+export interface SpellNavState {
+  wordStart: number;
+  wordEnd: number;
+  originalWord: string;
+  suggestions: string[];
+  selectedIndex: number;
+}
 
-const spellTooltipField = StateField.define<Tooltip | null>({
-  create: () => null,
-  update(tooltip, tr) {
-    if (tr.docChanged) return null; // dismiss whenever the document changes
-    for (const e of tr.effects) {
-      if (e.is(setSpellTooltip)) return e.value;
-    }
-    return tooltip;
-  },
-  provide: (f) => showTooltip.from(f),
-});
+export type SpellNavEvent =
+  | { type: "open"; wordStart: number; wordEnd: number; originalWord: string; suggestions: string[] }
+  | { type: "setIndex"; index: number }
+  | { type: "close" }
+  | { type: "docChanged" };
 
-function createSpellTooltip(
-  wordStart: number,
-  wordEnd: number,
-  originalWord: string,
-  suggestions: string[]
-): Tooltip {
+export function cycleSpellIndex(current: number, total: number): number {
+  return (current + 1) % total;
+}
+
+export function reduceSpellNavState(
+  state: SpellNavState | null,
+  event: SpellNavEvent
+): SpellNavState | null {
+  switch (event.type) {
+    case "docChanged":
+    case "close":
+      return null;
+    case "open":
+      return {
+        wordStart: event.wordStart,
+        wordEnd: event.wordEnd,
+        originalWord: event.originalWord,
+        suggestions: event.suggestions,
+        selectedIndex: 0,
+      };
+    case "setIndex":
+      if (!state) return null;
+      return { ...state, selectedIndex: event.index };
+  }
+}
+
+interface SpellTooltipState extends SpellNavState {
+  tooltip: Tooltip;
+}
+
+const setSpellTooltipEffect = StateEffect.define<Omit<SpellTooltipState, "tooltip" | "selectedIndex"> | null>();
+const setSpellIndexEffect = StateEffect.define<number>();
+
+// Forward declaration: assigned after buildTooltip, referenced inside its update callback.
+let spellStateField!: StateField<SpellTooltipState | null>;
+
+function buildTooltip(meta: Omit<SpellTooltipState, "tooltip" | "selectedIndex">): Tooltip {
   return {
-    pos: wordStart,
+    pos: meta.wordStart,
     above: true,
     strictSide: false,
     arrow: false,
@@ -133,34 +165,108 @@ function createSpellTooltip(
       const dom = document.createElement("div");
       dom.className = "autocorrect-spell-tooltip";
 
-      for (const suggestion of suggestions) {
+      const buttons: HTMLButtonElement[] = [];
+      for (const suggestion of meta.suggestions) {
         const btn = document.createElement("button");
         btn.textContent = suggestion;
         btn.className = "autocorrect-spell-btn";
         btn.addEventListener("mousedown", (e) => {
-          e.preventDefault(); // keep editor focus
+          e.preventDefault();
           view.dispatch({
-            changes: { from: wordStart, to: wordEnd, insert: preserveCase(originalWord, suggestion) },
+            changes: { from: meta.wordStart, to: meta.wordEnd, insert: preserveCase(meta.originalWord, suggestion) },
             annotations: [autocorrectAnnotation.of(true), Transaction.addToHistory.of(true)],
           });
         });
         dom.appendChild(btn);
+        buttons.push(btn);
       }
 
       const dismiss = document.createElement("button");
       dismiss.textContent = "×";
       dismiss.className = "autocorrect-spell-dismiss";
-      dismiss.title = "Dismiss";
+      dismiss.title = "Dismiss (Esc)";
       dismiss.addEventListener("mousedown", (e) => {
         e.preventDefault();
-        view.dispatch({ effects: setSpellTooltip.of(null) });
+        view.dispatch({ effects: setSpellTooltipEffect.of(null) });
       });
       dom.appendChild(dismiss);
 
-      return { dom };
+      const hint = document.createElement("span");
+      hint.className = "autocorrect-spell-hint";
+      hint.textContent = "Tab · Enter · Esc";
+      dom.appendChild(hint);
+
+      // Highlight the initial selection
+      if (buttons.length > 0) buttons[0].classList.add("autocorrect-spell-btn-selected");
+
+      return {
+        dom,
+        update(viewUpdate: ViewUpdate) {
+          const s = viewUpdate.state.field(spellStateField);
+          if (!s) return;
+          buttons.forEach((btn, i) => {
+            btn.classList.toggle("autocorrect-spell-btn-selected", i === s.selectedIndex);
+          });
+        },
+      };
     },
   };
 }
+
+spellStateField = StateField.define<SpellTooltipState | null>({
+  create: () => null,
+  update(state, tr) {
+    for (const e of tr.effects) {
+      if (e.is(setSpellTooltipEffect)) {
+        const nav = reduceSpellNavState(state, e.value ? { type: "open", ...e.value } : { type: "close" });
+        if (!nav) return null;
+        return { ...nav, tooltip: buildTooltip(e.value!) };
+      }
+      if (e.is(setSpellIndexEffect) && state) {
+        const nav = reduceSpellNavState(state, { type: "setIndex", index: e.value });
+        return nav ? { ...nav, tooltip: state.tooltip } : null;
+      }
+    }
+    if (tr.docChanged) return reduceSpellNavState(state, { type: "docChanged" }) as null;
+    return state;
+  },
+  provide: (f) => showTooltip.from(f, (s) => (s ? s.tooltip : null)),
+});
+
+const spellTooltipKeymap = keymap.of([
+  {
+    key: "Tab",
+    run(view: EditorView): boolean {
+      const s = view.state.field(spellStateField);
+      if (!s) return false;
+      const nextIndex = (s.selectedIndex + 1) % s.suggestions.length;
+      view.dispatch({ effects: setSpellIndexEffect.of(nextIndex) });
+      return true;
+    },
+  },
+  {
+    key: "Enter",
+    run(view: EditorView): boolean {
+      const s = view.state.field(spellStateField);
+      if (!s) return false;
+      const suggestion = s.suggestions[s.selectedIndex];
+      view.dispatch({
+        changes: { from: s.wordStart, to: s.wordEnd, insert: preserveCase(s.originalWord, suggestion) },
+        annotations: [autocorrectAnnotation.of(true), Transaction.addToHistory.of(true)],
+      });
+      return true;
+    },
+  },
+  {
+    key: "Escape",
+    run(view: EditorView): boolean {
+      const s = view.state.field(spellStateField);
+      if (!s) return false;
+      view.dispatch({ effects: setSpellTooltipEffect.of(null) });
+      return true;
+    },
+  },
+]);
 
 // ============================================================================
 // Autocorrect CM6 Extension
@@ -264,7 +370,7 @@ function createAutocorrectExtension(
     if (spellCandidates.length > 0) {
       const { wordStart, wordEnd, originalWord, suggestions } = spellCandidates[0];
       update.view.dispatch({
-        effects: setSpellTooltip.of(createSpellTooltip(wordStart, wordEnd, originalWord, suggestions)),
+        effects: setSpellTooltipEffect.of({ wordStart, wordEnd, originalWord, suggestions }),
       });
     }
   });
@@ -541,8 +647,9 @@ export default class AutocorrectPlugin extends Plugin {
 
     // Register the CM6 editor extensions
     this.registerEditorExtension([
-      spellTooltipField,
+      spellStateField,
       tooltips(),
+      Prec.highest(spellTooltipKeymap),
       createAutocorrectExtension(
         () => this.settings,
         () => this.dictionary,

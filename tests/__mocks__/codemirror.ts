@@ -10,5 +10,10 @@ export const StateEffect = { define: () => ({ of: () => ({}) }) };
 export const Transaction = { addToHistory: { of: () => ({}) } };
 export const Annotation = { define: () => ({ of: () => ({}) }) };
 export const RangeSetBuilder = class {};
+export const Prec = { highest: (x: unknown) => x };
+export const Tooltip = {};
+export const showTooltip = { from: () => ({}) };
+export const tooltips = () => ({});
+export const keymap = { of: () => ({}) };
 
 export function syntaxTree() { return { cursor: () => ({}) }; }
